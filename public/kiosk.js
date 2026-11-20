@@ -19,6 +19,7 @@ function showScan() {
   clearTimeout(timer); state = 'scan'; streak = 0;
   if (camOk && faceOk) {
     setPanel('', `<p class="k-big">Look at the camera</p><p class="k-sub">One person at a time, face inside the circle.</p>
+      <p class="k-sub" id="dark" hidden style="color:var(--warn);font-weight:700">It is too dark here. Switch on a light or face the light, or use PIN.</p>
       <button class="k-btn ghost" id="pinbtn">Use PIN</button>
       <p class="note">No photo is sent or saved.<br>Did not agree to face attendance? Use PIN.</p>`);
   } else {
@@ -116,8 +117,18 @@ function showRejected(text) {
   setPanel('bad', `<p class="k-big">Not accepted</p><p class="k-sub">${esc(text)}</p><button class="k-btn" id="again">OK</button>`);
   bind('again', showScan); after(6000, showScan);
 }
+let darkFrames = 0;
+function showDarkHint(r) {
+  // B12: after about 2 s of very dark frames with no face, tell the worker why nothing is happening
+  darkFrames = r.brightness < 20 && !r.descriptor ? darkFrames + 1 : 0;
+  const el = document.getElementById('dark'); if (el) el.hidden = darkFrames < 12;
+}
 function handleFace(r) {
-  if (!r || r.score < 0.6) { streak = 0; return; }
+  if (state !== 'scan') return;
+  showDarkHint(r);
+  // B12: in dim light (frame brightened by readFace) accept a slightly less certain detection; the server still
+  // decides who it is with the same strict threshold and margin, so this cannot cause a wrong-person match by itself
+  if (!r.descriptor || r.score < (r.dim ? 0.5 : 0.6)) { streak = 0; return; }
   // BR4: wait for 3 consecutive good frames, then send the descriptor of the 3rd; the server matches it
   if (++streak >= 3) submitFace(r.descriptor);
 }
@@ -125,7 +136,7 @@ async function loop() {
   try {
     if (state === 'scan' && camOk && faceOk && video.readyState >= 2) {
       const r = await readFace(video, 320);
-      if (state === 'scan') handleFace(r);
+      handleFace(r);
     }
   } catch (e) { console.warn(e); }
   setTimeout(loop, 120);
@@ -137,6 +148,8 @@ function tick() { const d = new Date(); document.getElementById('clock').textCon
   tick(); setInterval(tick, 1000);
   setPanel('', `<p class="k-big">Starting...</p><p class="k-sub">Loading camera and face recognition</p><button class="k-btn ghost" id="pinbtn">Use PIN</button>`);
   bind('pinbtn', showPin);
+  // B14: start downloading the face library and models while the camera starts (they used to load one after the other)
+  const faceLoading = loadFaceApi(); faceLoading.catch(() => {});
   const setup = await (await fetch('/api/kiosk/setup')).json();
   const sel = document.getElementById('kiosk');
   sel.innerHTML = setup.kiosks.map(k => `<option value="${k.id}">${esc(k.name)} - ${esc(k.location)}</option>`).join('');
@@ -149,7 +162,7 @@ function tick() { const d = new Date(); document.getElementById('clock').textCon
   try { await startCamera(video); camOk = true; }
   catch (e) { camMsg = 'Camera is not available. Please use your worker code and PIN.'; off.hidden = false; off.textContent = 'Camera unavailable'; document.getElementById('guide').hidden = true; }
   if (camOk) {
-    try { await loadFaceApi(); faceOk = true; }
+    try { await faceLoading; faceOk = true; }
     catch (e) { camMsg = 'Face recognition could not load. Please use your worker code and PIN.'; }
   }
   if (state === 'loading') showScan();

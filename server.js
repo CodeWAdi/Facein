@@ -4,6 +4,7 @@ const express = require('express');
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 const path = require('path');
+const compression = require('compression');
 
 const PORT = process.env.PORT || 3000;
 const SECRET = process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
@@ -12,6 +13,7 @@ const VIEW = ['supervisor', 'hr', 'owner'];
 
 const app = express();
 app.set('trust proxy', 1);
+app.use(compression()); // B14: gzip pages, scripts and JSON (face-api.js 1.3 MB -> about 0.35 MB)
 app.use(express.json({ limit: '20kb' })); // small limit: images can never be uploaded
 app.use((req, res, next) => { res.set('Permissions-Policy', 'camera=(self)'); res.set('X-Content-Type-Options', 'nosniff'); next(); });
 
@@ -444,6 +446,17 @@ app.put('/api/admin/kiosks/:id', auth('admin'), async (req, res) => {
 });
 
 // ---------- static pages ----------
+// B14/O3: face-api.js and the 3 models the app uses are served from our own package (no CDN). The URL carries the
+// version, so the browser may cache them for 30 days; a library upgrade changes the URL.
+const FACE_DIR = path.dirname(require.resolve('@vladmandic/face-api/package.json'));
+const VENDOR = { maxAge: '30d', immutable: true, fallthrough: false };
+app.get('/vendor/face-api@1.7.15/face-api.js', (req, res) => res.sendFile(path.join(FACE_DIR, 'dist', 'face-api.js'), VENDOR));
+const MODELS = ['tiny_face_detector_model', 'face_landmark_68_model', 'face_recognition_model'];
+app.get('/vendor/face-api@1.7.15/model/:file', (req, res, next) => {
+  const m = /^([a-z0-9_]+?)(-weights_manifest\.json|\.bin)$/.exec(req.params.file);
+  if (!m || !MODELS.includes(m[1])) return next();
+  res.sendFile(path.join(FACE_DIR, 'model', req.params.file), VENDOR);
+});
 app.use(express.static(path.join(__dirname, 'public'), { extensions: ['html'] }));
 app.get('/', async (req, res) => res.sendFile(path.join(__dirname, 'public', 'login.html')));
 

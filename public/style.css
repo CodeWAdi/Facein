@@ -32,6 +32,11 @@ label { display: block; font-weight: 600; font-size: .9rem; color: var(--muted);
 input, select, textarea { font: inherit; padding: 10px 12px; border: 1px solid #b9c5d4; border-radius: 8px; background: #fff; color: var(--ink); width: 100%; }
 textarea { min-height: 90px; }
 .field { margin-bottom: 12px; min-width: 160px; }
+.row.form-row > .field { flex: 1 1 240px; }
+.hint { font-size: .9rem; color: var(--muted); margin: 4px 0 0; max-width: 46ch; }
+.field-err { font-size: .95rem; color: var(--bad); font-weight: 700; margin: 4px 0 0; }
+.req { color: var(--bad); }
+[aria-invalid="true"] { border-color: var(--bad); outline: 2px solid var(--bad-bg); }
 button, .btn { font: inherit; font-weight: 700; cursor: pointer; border-radius: 8px; padding: 10px 16px; border: 1px solid var(--navy); background: var(--navy); color: #fff; text-decoration: none; display: inline-block; }
 button.ghost, .btn.ghost { background: #fff; color: var(--navy); }
 button.danger { background: var(--bad); border-color: var(--bad); }

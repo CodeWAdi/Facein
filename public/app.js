@@ -216,44 +216,81 @@ function captureWidget(el, onDone) {
   }).catch(e => { m.innerHTML = msg('Camera or face models unavailable: ' + e.message + '. You can go back and choose PIN only.'); });
   btn.onclick = async () => {
     btn.disabled = true; m.textContent = 'Capturing... hold still';
-    const samples = [];
+    const samples = []; let light = 255;
     for (let i = 0; i < 20 && samples.length < 3; i++) {
       const r = await readFace(video, 416).catch(() => null);
-      if (r && r.score >= 0.7) samples.push(r.descriptor);
+      if (r) light = Math.min(light, r.brightness);
+      if (r && r.descriptor && r.score >= 0.7) samples.push(r.descriptor);
       await new Promise(res => setTimeout(res, 200));
     }
     btn.disabled = false;
     if (samples.length < 3 || euclid(samples[0], samples[1]) > 0.35 || euclid(samples[1], samples[2]) > 0.35) {
-      m.innerHTML = msg('Face not clear. Use good light, one person only, look straight at the camera and try again.'); onDone(null); return;
+      // B12: enrol in good light; a template from a dark room makes later check-ins less reliable
+      m.innerHTML = msg(light < 60 ? 'The room is too dark for a good face capture. Switch on a light or face a window, then try again.'
+        : 'Face not clear. Use good light, one person only, look straight at the camera and try again.'); onDone(null); return;
     }
     const avg = Array.from({ length: 128 }, (_, k) => (samples[0][k] + samples[1][k] + samples[2][k]) / 3);
     m.innerHTML = msg('Face captured: 128 numbers ready to save. No photo is saved.', 'ok'); btn.textContent = 'Retake';
     onDone(avg);
   };
 }
-const pinFields = () => `<div class="row"><div class="field"><label>4-digit PIN</label><input id="p1" type="password" inputmode="numeric" maxlength="4" autocomplete="off"></div>
-  <div class="field"><label>Confirm PIN</label><input id="p2" type="password" inputmode="numeric" maxlength="4" autocomplete="off"></div></div>`;
+// B13: every field has a plain label, a hint under it, and its own error message next to it.
+const fieldHtml = (id, label, input, hint) => `<div class="field"><label for="${id}">${label} <span class="req" aria-hidden="true">*</span></label>${input}
+  <p class="hint" id="${id}-hint">${hint}</p><p class="field-err" id="${id}-err" role="alert" hidden></p></div>`;
+function fieldErrors(errs) { // errs: { fieldId: 'message' }; clears the others, focuses the first bad field
+  document.querySelectorAll('.field-err').forEach(e => { e.hidden = true; e.textContent = ''; });
+  document.querySelectorAll('[aria-invalid]').forEach(e => e.removeAttribute('aria-invalid'));
+  const ids = Object.keys(errs);
+  ids.forEach(id => { const el = document.getElementById(id), e = document.getElementById(id + '-err'); el.setAttribute('aria-invalid', 'true'); e.textContent = errs[id]; e.hidden = false; });
+  if (ids.length) document.getElementById(ids[0]).focus();
+  return ids.length === 0;
+}
+const pinFields = () => `<div class="row form-row">
+  ${fieldHtml('p1', 'Backup PIN (4 digits)', '<input id="p1" type="password" inputmode="numeric" maxlength="4" autocomplete="off" aria-describedby="p1-hint p1-err">',
+    'The worker types their worker code and this PIN at the kiosk if the face is not recognised. Tell the worker their PIN. Avoid easy PINs such as 1234 or 0000.')}
+  ${fieldHtml('p2', 'Type the PIN again', '<input id="p2" type="password" inputmode="numeric" maxlength="4" autocomplete="off" aria-describedby="p2-hint p2-err">',
+    'Must be the same 4 digits, to catch typing mistakes.')}</div>`;
 const readPin = () => {
-  const a = document.getElementById('p1').value, b = document.getElementById('p2').value;
-  if (!/^\d{4}$/.test(a)) throw new Error('PIN must be exactly 4 digits'); if (a !== b) throw new Error('The two PINs do not match'); return a;
+  const a = document.getElementById('p1').value.trim(), b = document.getElementById('p2').value.trim();
+  if (!/^\d{4}$/.test(a)) { fieldErrors({ p1: a ? `The PIN must be exactly 4 digits (you typed ${a.length} character${a.length === 1 ? '' : 's'}${/\D/.test(a) ? ', not all digits' : ''}).` : 'Enter a 4-digit PIN.' }); return null; }
+  if (a !== b) { fieldErrors({ p2: b ? 'This does not match the PIN above. Type the same 4 digits again.' : 'Type the PIN a second time.' }); return null; }
+  fieldErrors({}); return a;
 };
 
 async function viewNewWorker() {
   if (!isSup()) throw new Error('Only a Supervisor can enrol workers');
-  const wz = { step: 0, name: '', code: '', shift_id: SHIFTS[0] && SHIFTS[0].id, accepted: false, descriptor: null };
+  const wz = { step: 0, name: '', code: '', shift_id: '', accepted: false, descriptor: null };
+  // B13: suggest the next free worker code, and check codes on step 1 instead of only at the final Save
+  const existing = await api('/api/workers'), used = new Set(existing.map(w => String(w.employee_code)));
+  const nextCode = String(Math.max(1000, ...existing.map(w => Number(w.employee_code)).filter(n => n < 999999)) + 1);
   const NAMES = ['Details', 'Consent', 'Face or PIN'];
   const render = () => {
     stopCamera(); captureSession++;
     if (wz.step === 0) {
       V.innerHTML = `<p><a href="#/workers">&larr; Cancel</a></p><h1>Add worker</h1>${steps(NAMES, 0)}<div class="card">
-        <div class="field"><label>Full name</label><input id="n" value="${esc(wz.name)}"></div>
-        <div class="row"><div class="field"><label>Worker code (digits, used on kiosk keypad)</label><input id="code" inputmode="numeric" value="${esc(wz.code)}"></div>
-        <div class="field"><label>Shift</label><select id="sh">${shiftOptions(wz.shift_id, false)}</select></div></div>
-        <div id="e"></div><button id="next">Next: consent</button></div>`;
-      document.getElementById('next').onclick = () => {
-        wz.name = document.getElementById('n').value.trim(); wz.code = document.getElementById('code').value.trim(); wz.shift_id = document.getElementById('sh').value;
-        if (wz.name.length < 2) return document.getElementById('e').innerHTML = msg('Enter the worker name');
-        if (!/^\d{3,6}$/.test(wz.code)) return document.getElementById('e').innerHTML = msg('Worker code must be 3 to 6 digits');
+        <p class="muted" style="margin-top:0">Step 1 of 3: the worker's details. Next you will read the consent notice to the worker, then capture their face or set a PIN only. All fields marked <span class="req">*</span> are required.</p>
+        <form id="wf" novalidate>
+        ${fieldHtml('n', 'Full name', `<input id="n" value="${esc(wz.name)}" maxlength="80" autocomplete="off" aria-describedby="n-hint n-err" placeholder="e.g. Ramesh Kumar">`,
+          'As it should appear on attendance reports and payroll.')}
+        <div class="row form-row">
+        ${fieldHtml('code', 'Worker code', `<input id="code" inputmode="numeric" maxlength="6" autocomplete="off" value="${esc(wz.code || nextCode)}" aria-describedby="code-hint code-err">`,
+          `3 to 6 digits, only numbers. The worker types it on the kiosk keypad when using PIN, so it must be unique. Suggested next free code: <strong>${esc(nextCode)}</strong>.`)}
+        ${fieldHtml('sh', 'Shift', `<select id="sh" aria-describedby="sh-hint sh-err"><option value="">Choose the worker's usual shift</option>${shiftOptions(wz.shift_id, false)}</select>`,
+          'Check-in opens 2 hours before the shift starts. Arriving after the grace time is marked Late.')}
+        </div>
+        <div id="e"></div><button id="next" type="submit">Next: consent notice</button></form></div>`;
+      document.getElementById('wf').onsubmit = e => {
+        e.preventDefault();
+        wz.name = document.getElementById('n').value.trim().replace(/\s+/g, ' '); wz.code = document.getElementById('code').value.trim(); wz.shift_id = document.getElementById('sh').value;
+        const errs = {};
+        if (wz.name.length < 2) errs.n = 'Enter the worker\'s full name (at least 2 letters).';
+        else if (!/\p{L}/u.test(wz.name)) errs.n = 'The name should contain letters, not only numbers or symbols.';
+        if (!wz.code) errs.code = 'Enter a worker code, for example ' + nextCode + '.';
+        else if (!/^\d+$/.test(wz.code)) errs.code = 'Use digits only (0-9). The kiosk keypad has no letters.';
+        else if (wz.code.length < 3 || wz.code.length > 6) errs.code = `The code must be 3 to 6 digits; it has ${wz.code.length}.`;
+        else if (used.has(wz.code)) errs.code = `Code ${wz.code} already belongs to another worker. Try ${nextCode}.`;
+        if (!wz.shift_id) errs.sh = 'Choose a shift.';
+        if (!fieldErrors(errs)) return;
         wz.step = 1; render();
       };
     } else if (wz.step === 1) {
@@ -268,13 +305,14 @@ async function viewNewWorker() {
       V.innerHTML = `<h1>Add worker: ${esc(wz.name)}</h1>${steps(NAMES, 2)}<div class="card">
         ${wz.accepted ? `<h2>Face capture</h2><p class="muted">Consent accepted (notice ${esc(NOTICE.version)}). Only numbers are stored, never an image.</p><div id="cap"></div><h2 style="margin-top:18px">Backup PIN</h2><p class="muted">Used if the camera is down or the face is not recognised.</p>`
           : `<h2>PIN only</h2><p class="muted">The worker declined face attendance. No face data will be collected. Set a PIN.</p>`}
-        ${pinFields()}<div id="e"></div><div class="row"><button id="save" ${wz.accepted ? 'disabled' : ''}>Save worker</button><button class="ghost" id="back">Back</button></div></div>`;
+        ${pinFields()}<div id="e"></div>${wz.accepted ? '<p class="hint" id="save-hint">Save becomes available after the face is captured.</p>' : ''}
+        <div class="row"><button id="save" ${wz.accepted ? 'disabled' : ''}>Save worker</button><button class="ghost" id="back">Back</button></div></div>`;
       const save = document.getElementById('save');
-      if (wz.accepted) captureWidget(document.getElementById('cap'), d => { wz.descriptor = d; save.disabled = !d; });
+      if (wz.accepted) captureWidget(document.getElementById('cap'), d => { wz.descriptor = d; save.disabled = !d; document.getElementById('save-hint').hidden = !!d; });
       document.getElementById('back').onclick = () => { wz.step = 1; wz.descriptor = null; render(); };
       save.onclick = async () => {
         try {
-          const pin = readPin();
+          const pin = readPin(); if (!pin) return;
           const r = await api('/api/workers', { method: 'POST', body: { name: wz.name, employee_code: wz.code, shift_id: Number(wz.shift_id), pin,
             consent: { accepted: wz.accepted, notice_version: NOTICE.version }, descriptor: wz.accepted ? wz.descriptor : undefined } });
           stopCamera(); FLASH = `${wz.name} saved${wz.accepted ? ' with face template and consent' : ' with PIN only'}.`; location.hash = `#/workers/${r.id}`;

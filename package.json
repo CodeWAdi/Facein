@@ -13,7 +13,9 @@
   },
   "dependencies": {
     "@electric-sql/pglite": "^0.5.17",
+    "@vladmandic/face-api": "^1.7.15",
     "bcryptjs": "^2.4.3",
+    "compression": "^1.8.1",
     "express": "^5.1.0",
     "pg": "^8.23.1"
   }
