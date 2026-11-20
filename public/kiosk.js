@@ -1,9 +1,9 @@
-// FaceIn kiosk: public page, no login. Face matching runs in this browser; only worker id + match distance are sent.
+// FaceIn kiosk: public page, no login. Only the 128-number face descriptor and kiosk id are sent; the server does the matching.
 const P = document.getElementById('panel'), video = document.getElementById('video');
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-let KIOSK_ID = null, THRESHOLD = 0.45, TEMPLATES = [];
+let KIOSK_ID = null;
 let camOk = false, faceOk = false, camMsg = 'Starting camera...';
-let state = 'loading', streak = 0, lastId = null, unknownFrames = 0, timer = null;
+let state = 'loading', streak = 0, timer = null;
 
 async function post(url, body) {
   const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
@@ -16,11 +16,11 @@ function after(ms, fn) { clearTimeout(timer); timer = setTimeout(fn, ms); }
 function bind(id, fn) { const el = document.getElementById(id); if (el) el.onclick = fn; }
 
 function showScan() {
-  clearTimeout(timer); state = 'scan'; streak = 0; lastId = null; unknownFrames = 0;
+  clearTimeout(timer); state = 'scan'; streak = 0;
   if (camOk && faceOk) {
     setPanel('', `<p class="k-big">Look at the camera</p><p class="k-sub">One person at a time, face inside the circle.</p>
       <button class="k-btn ghost" id="pinbtn">Use PIN</button>
-      <p class="note">Face check runs only on this device. No photo is sent or saved.<br>Did not agree to face attendance? Use PIN.</p>`);
+      <p class="note">No photo is sent or saved.<br>Did not agree to face attendance? Use PIN.</p>`);
   } else {
     setPanel('', `<p class="k-big">Use PIN</p><p class="k-sub">${esc(camMsg)}</p><button class="k-btn" id="pinbtn">Use PIN</button>`);
   }
@@ -102,25 +102,17 @@ document.addEventListener('keydown', e => {
 });
 
 // ---------- face loop ----------
-async function submitFace(workerId, distance) {
+async function submitFace(descriptor) {
   state = 'busy'; setPanel('', '<p class="k-big">Checking...</p>');
   try {
-    const r = await post('/api/kiosk/face', { kiosk_id: KIOSK_ID, worker_id: workerId, distance: workerId ? Number(distance.toFixed(4)) : undefined });
+    const r = await post('/api/kiosk/face', { kiosk_id: KIOSK_ID, descriptor: Array.from(descriptor, x => Number(x.toFixed(6))) });
     if (r.result === 'not_recognised') showNotRecognised(); else showResult(r);
   } catch (e) { showError(e.message); }
 }
 function handleFace(r) {
-  if (!r || r.score < 0.6) { streak = 0; lastId = null; if (!r) unknownFrames = Math.max(0, unknownFrames - 1); return; }
-  let best = null, bd = Infinity;
-  for (const t of TEMPLATES) { const d = euclid(r.descriptor, t.descriptor); if (d < bd) { bd = d; best = t; } }
-  if (best && bd <= THRESHOLD) { // BR4: strict threshold, and the same person in 3 consecutive frames
-    unknownFrames = 0;
-    if (best.worker_id === lastId) streak++; else { lastId = best.worker_id; streak = 1; }
-    if (streak >= 3) submitFace(best.worker_id, bd);
-  } else {
-    streak = 0; lastId = null; unknownFrames++;
-    if (unknownFrames >= 8) submitFace(null);
-  }
+  if (!r || r.score < 0.6) { streak = 0; return; }
+  // BR4: wait for 3 consecutive good frames, then send the descriptor of the 3rd; the server matches it
+  if (++streak >= 3) submitFace(r.descriptor);
 }
 async function loop() {
   try {
@@ -131,12 +123,6 @@ async function loop() {
   } catch (e) { console.warn(e); }
   setTimeout(loop, 120);
 }
-async function loadTemplates() {
-  try {
-    const t = await (await fetch('/api/kiosk/templates')).json();
-    TEMPLATES = t.map(x => ({ worker_id: x.worker_id, descriptor: Float32Array.from(x.descriptor) }));
-  } catch (e) { console.warn('templates', e); }
-}
 
 // ---------- start ----------
 function tick() { const d = new Date(); document.getElementById('clock').textContent = d.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: false }); }
@@ -145,7 +131,6 @@ function tick() { const d = new Date(); document.getElementById('clock').textCon
   setPanel('', `<p class="k-big">Starting...</p><p class="k-sub">Loading camera and face recognition</p><button class="k-btn ghost" id="pinbtn">Use PIN</button>`);
   bind('pinbtn', showPin);
   const setup = await (await fetch('/api/kiosk/setup')).json();
-  THRESHOLD = setup.threshold;
   const sel = document.getElementById('kiosk');
   sel.innerHTML = setup.kiosks.map(k => `<option value="${k.id}">${esc(k.name)} - ${esc(k.location)}</option>`).join('');
   let saved = null; try { saved = localStorage.getItem('facein_kiosk'); } catch (e) {}
@@ -157,10 +142,9 @@ function tick() { const d = new Date(); document.getElementById('clock').textCon
   try { await startCamera(video); camOk = true; }
   catch (e) { camMsg = 'Camera is not available. Please use your worker code and PIN.'; off.hidden = false; off.textContent = 'Camera unavailable'; document.getElementById('guide').hidden = true; }
   if (camOk) {
-    try { await Promise.all([loadFaceApi(), loadTemplates()]); faceOk = true; }
+    try { await loadFaceApi(); faceOk = true; }
     catch (e) { camMsg = 'Face recognition could not load. Please use your worker code and PIN.'; }
   }
-  setInterval(loadTemplates, 60000);
   if (state === 'loading') showScan();
   loop();
 })();

@@ -87,22 +87,28 @@ app.get('/api/kiosk/setup', (req, res) => res.json({
   kiosks: db.prepare('SELECT id, name, location FROM kiosk ORDER BY id').all(),
   threshold: FACE_THRESHOLD
 }));
-app.get('/api/kiosk/templates', (req, res) => {
-  const rows = db.prepare(`SELECT ft.worker_id, w.name, ft.descriptor FROM face_template ft JOIN worker w ON w.id = ft.worker_id
-    WHERE w.active = 1 AND ${ACTIVE_CONSENT_SQL} = 'grant'`).all();
-  res.json(rows.map(r => ({ worker_id: r.worker_id, name: r.name, descriptor: JSON.parse(r.descriptor) })));
-});
+// BR4 (server side): the kiosk sends only the live face descriptor; the server does the matching itself.
+// BR3: only templates of active workers with active consent are compared.
+const MATCH_MARGIN = 0.05; // the next-closest worker must be at least this much further away
+const euclid = (a, b) => { let s = 0; for (let i = 0; i < a.length; i++) { const d = a[i] - b[i]; s += d * d; } return Math.sqrt(s); };
 app.post('/api/kiosk/face', (req, res) => {
-  const { kiosk_id, worker_id, distance } = req.body || {};
+  const { kiosk_id, descriptor } = req.body || {};
   const k = getKiosk(kiosk_id);
-  if (!worker_id) { logAttempt(null, k.id, 'face', 'rejected_unknown_face'); return res.json({ result: 'not_recognised' }); }
-  const w = db.prepare('SELECT * FROM worker WHERE id = ?').get(Number(worker_id));
-  const hasTpl = w && db.prepare('SELECT 1 FROM face_template WHERE worker_id = ?').get(w.id);
-  // BR4 (server side): distance must be below the strict threshold; BR3: template + active consent required
-  if (!w || !w.active || !hasTpl || !hasActiveConsent(w.id) || typeof distance !== 'number' || !(distance <= FACE_THRESHOLD)) {
-    logAttempt(w ? w.id : null, k.id, 'face', 'rejected_low_confidence');
+  if (!validDescriptor(descriptor)) bad('Face data is not valid. Capture again.');
+  const rows = db.prepare(`SELECT ft.worker_id, ft.descriptor FROM face_template ft JOIN worker w ON w.id = ft.worker_id
+    WHERE w.active = 1 AND ${ACTIVE_CONSENT_SQL} = 'grant'`).all();
+  const best = new Map(); // worker_id -> closest distance over that worker's templates
+  for (const r of rows) {
+    const d = euclid(descriptor, JSON.parse(r.descriptor));
+    if (!best.has(r.worker_id) || d < best.get(r.worker_id)) best.set(r.worker_id, d);
+  }
+  const ranked = [...best].sort((a, b) => a[1] - b[1]);
+  const [first, second] = ranked;
+  if (!first || !(first[1] <= FACE_THRESHOLD) || (second && second[1] - first[1] < MATCH_MARGIN)) {
+    logAttempt(null, k.id, 'face', 'rejected_low_confidence');
     return res.json({ result: 'not_recognised' });
   }
+  const w = db.prepare('SELECT * FROM worker WHERE id = ?').get(first[0]);
   res.json(checkIn(w, k.id, 'face'));
 });
 app.post('/api/kiosk/pin', (req, res) => {
