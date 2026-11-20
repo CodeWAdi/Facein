@@ -60,6 +60,13 @@ const validDescriptor = d => Array.isArray(d) && d.length === 128 && d.every(x =
 const validDate = d => /^\d{4}-\d{2}-\d{2}$/.test(d || '') && !isNaN(new Date(d + 'T00:00:00'));
 const getKiosk = id => db.prepare('SELECT * FROM kiosk WHERE id = ?').get(Number(id)) || bad('Unknown kiosk');
 
+// B07: a check-in is accepted only from 2 hours before shift start until shift end (handles shifts that cross midnight)
+const EARLY_MIN = 120;
+function inShiftWindow(shift, nowMin) {
+  const from = (toMin(shift.start) - EARLY_MIN + 1440) % 1440, to = toMin(shift.end);
+  return from <= to ? nowMin >= from && nowMin <= to : nowMin >= from || nowMin <= to;
+}
+
 // BR1 + BR2: one record per worker per date; late after start + grace
 function checkIn(w, kioskId, method) {
   const now = new Date(), date = fmtDate(now), hm = fmtHM(now);
@@ -69,6 +76,10 @@ function checkIn(w, kioskId, method) {
     return { result: 'already_marked', name: w.name, status: existing.status, time: existing.check_in_time };
   }
   const shift = db.prepare('SELECT * FROM shift WHERE id = ?').get(w.shift_id);
+  if (!inShiftWindow(shift, now.getHours() * 60 + now.getMinutes())) {
+    logAttempt(w.id, kioskId, method, 'rejected_outside_shift');
+    return { result: 'rejected', name: w.name, message: `Not your shift time. ${shift.name} shift check-in opens 2 hours before ${shift.start} and closes at ${shift.end}.` };
+  }
   const status = now.getHours() * 60 + now.getMinutes() > toMin(shift.start) + shift.grace_minutes ? 'late' : 'present';
   try {
     tx(() => {
@@ -219,6 +230,22 @@ app.post('/api/workers', auth('supervisor'), (req, res) => {
   res.json({ id });
 });
 
+// B06: Supervisor can fix a worker's name or shift, reset the PIN, and deactivate or reactivate the worker.
+// Inactive workers cannot check in (face or PIN) and drop out of the Absent list.
+app.put('/api/workers/:id', auth('supervisor'), (req, res) => {
+  const w = db.prepare('SELECT * FROM worker WHERE id = ?').get(Number(req.params.id));
+  if (!w) throw new HttpError(404, 'Worker not found');
+  const { name, shift_id, pin, active } = req.body || {};
+  const nm = String(name || '').trim();
+  if (nm.length < 2 || nm.length > 80) bad('Enter the worker name');
+  if (!db.prepare('SELECT 1 FROM shift WHERE id = ?').get(Number(shift_id))) bad('Choose a shift');
+  if (typeof active !== 'boolean') bad('Choose active or inactive');
+  if (pin) validPin(pin);
+  db.prepare('UPDATE worker SET name = ?, shift_id = ?, active = ? WHERE id = ?').run(nm, Number(shift_id), active ? 1 : 0, w.id);
+  if (pin) db.prepare('UPDATE worker SET pin_hash = ? WHERE id = ?').run(bcrypt.hashSync(String(pin), 10), w.id);
+  res.json({ ok: true });
+});
+
 app.post('/api/workers/:id/enrol-face', auth('supervisor'), (req, res) => {
   const { accepted, notice_version, descriptor } = req.body || {};
   const w = db.prepare('SELECT * FROM worker WHERE id = ?').get(Number(req.params.id));
@@ -280,6 +307,7 @@ app.post('/api/override', auth('supervisor'), (req, res) => {
     if (attendance_id) rec = db.prepare('SELECT * FROM daily_attendance WHERE id = ?').get(Number(attendance_id));
     else {
       if (!validDate(date) || date > fmtDate(new Date())) bad('Bad date');
+      if (isSunday(date)) bad('Sunday is the weekly off. Overrides are not allowed on a Sunday.'); // B08
       if (!db.prepare('SELECT 1 FROM worker WHERE id = ?').get(Number(worker_id))) bad('Worker not found');
       rec = db.prepare('SELECT * FROM daily_attendance WHERE worker_id = ? AND date = ?').get(Number(worker_id), date);
       if (!rec) {
@@ -288,6 +316,7 @@ app.post('/api/override', auth('supervisor'), (req, res) => {
       }
     }
     if (!rec) throw new HttpError(404, 'Record not found');
+    if (isSunday(rec.date)) bad('Sunday is the weekly off. Overrides are not allowed on a Sunday.'); // B08
     if (rec.status === new_status) bad('The new status is the same as the current status');
     db.prepare('UPDATE daily_attendance SET status = ? WHERE id = ?').run(new_status, rec.id);
     db.prepare('INSERT INTO override (attendance_id, old_status, new_status, reason, supervisor_id, timestamp) VALUES (?,?,?,?,?,?)')
