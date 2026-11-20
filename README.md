@@ -3,6 +3,10 @@
 Node 22 + Express + PostgreSQL (hosted on Neon in production), vanilla JS front end. Face recognition runs in the browser with
 face-api.js (models from jsDelivr CDN); only a 128-number descriptor is stored, never an image.
 
+**Live scans** (Supervisor, HR, Owner): a page that lists every kiosk face scan and PIN entry as it happens, refreshing every
+3 seconds. It shows time, kiosk, method, result and the worker's name when known; a face that is not recognised shows as
+Unknown. It reads the existing check-in attempt log, so no face image or descriptor is stored for attempts.
+
 ## Run locally (webcam works on localhost)
     npm install
     npm start            # http://localhost:3000  (kiosk: http://localhost:3000/kiosk)

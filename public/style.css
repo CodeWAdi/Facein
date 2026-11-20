@@ -79,3 +79,6 @@ tr.click { cursor: pointer; } tr.click:hover td { background: #f5f8fd; }
   th, td { padding: 8px 6px; }
   .hide-sm { display: none; }
 }
+/* Live scans: briefly highlight attempts that just arrived */
+@keyframes live-flash { from { background: var(--warn-bg); } to { background: transparent; } }
+tr.live-new td { animation: live-flash 2.5s ease-out; }
