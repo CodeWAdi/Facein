@@ -5,7 +5,7 @@ const LABEL = {
   present: 'Present', late: 'Late', absent: 'Absent', not_started: 'Shift not started', weekly_off: 'Weekly off',
   grant: 'Consent given', withdraw: 'Consent withdrawn', none: 'No consent (PIN only)',
   success: 'Success', already_marked: 'Already marked', rejected_unknown_face: 'Rejected - face not recognised',
-  rejected_low_confidence: 'Rejected - low confidence', rejected_wrong_pin: 'Rejected - wrong PIN', rejected_locked: 'Rejected - PIN locked (too many wrong PINs)',
+  rejected_low_confidence: 'Rejected - low confidence', rejected_wrong_pin: 'Rejected - wrong PIN', rejected_locked: 'Rejected - PIN locked (too many wrong PINs)', rejected_outside_shift: 'Rejected - outside shift time',
   rejected_unknown_code: 'Rejected - unknown worker code', rejected_inactive: 'Rejected - inactive worker', face: 'Face', pin: 'PIN',
   supervisor: 'Supervisor', hr: 'HR Clerk', owner: 'Owner', admin: 'Admin'
 };
@@ -145,7 +145,15 @@ async function viewWorker(id) {
   const d = await api(`/api/workers/${id}`), w = d.worker, c = d.consents[0];
   V.innerHTML = `${flash()}<p><a href="#/workers">&larr; All workers</a></p><h1>${esc(w.name)}</h1>
     <div class="card"><dl class="kv"><dt>Worker code</dt><dd>${esc(w.employee_code)}</dd><dt>Shift</dt><dd>${esc(w.shift_name)} (${w.start}-${w.end}, grace ${w.grace_minutes} min)</dd>
-      <dt>Status</dt><dd>${w.active ? 'Active' : 'Inactive'}</dd><dt>PIN</dt><dd>Set (stored hashed)</dd></dl></div>
+      <dt>Status</dt><dd>${w.active ? 'Active' : 'Inactive <span class="muted">(cannot check in)</span>'}</dd><dt>PIN</dt><dd>Set (stored hashed)</dd></dl>
+      ${isSup() ? `<div id="w-edit-msg"></div><div class="row" style="margin-top:12px"><button id="w-edit">Edit worker</button>
+        <button class="${w.active ? 'danger' : ''}" id="w-active">${w.active ? 'Deactivate' : 'Reactivate'}</button></div>
+        <form id="w-form" hidden style="margin-top:12px">
+          <div class="field"><label>Full name<input id="we-name" value="${esc(w.name)}"></label></div>
+          <div class="field"><label>Shift<select id="we-shift">${shiftOptions(w.shift_id, false)}</select></label></div>
+          <div class="field"><label>New PIN (leave blank to keep the current PIN)<input id="we-pin" inputmode="numeric" maxlength="4" autocomplete="off"></label></div>
+          <div class="row"><button type="submit">Save changes</button><button type="button" class="ghost" id="we-cancel">Cancel</button></div>
+        </form>` : ''}</div>
     <div class="card"><h2>Consent and face data</h2>
       <dl class="kv"><dt>Consent</dt><dd>${pill(d.consent)}${c ? ` <span class="muted">notice ${esc(c.notice_version)}, ${esc(c.timestamp)}</span>` : ''}</dd>
       <dt>Face template</dt><dd>${d.face ? `Stored since ${esc(d.face.created_at)} <span class="muted">(128 numbers only, no image)</span>` : 'None stored'}</dd></dl>
@@ -161,6 +169,26 @@ async function viewWorker(id) {
       ${d.attendance.map(a => `<tr class="click" data-href="#/record/${a.id}"><td>${niceDate(a.date)}</td><td>${pill(a.status)}${a.overrides ? ' <span class="muted">&#9998; overridden</span>' : ''}</td><td>${esc(a.check_in_time || '-')}</td></tr>`).join('')}
       </table></div>` : '<p class="muted">No records yet</p>'}</div>`;
   bindRowClicks(V);
+  if (isSup()) { // B06: edit, reset PIN, deactivate/reactivate
+    const form = document.getElementById('w-form'), emsg = document.getElementById('w-edit-msg');
+    const save = async body => {
+      try { await api(`/api/workers/${w.id}`, { method: 'PUT', body: { name: w.name, shift_id: w.shift_id, active: !!w.active, ...body } }); viewWorker(id); }
+      catch (e) { FLASH = ''; emsg.innerHTML = msg(e.message); }
+    };
+    document.getElementById('w-edit').onclick = () => { form.hidden = false; };
+    document.getElementById('we-cancel').onclick = () => { form.hidden = true; };
+    form.onsubmit = e => {
+      e.preventDefault();
+      const pin = document.getElementById('we-pin').value.trim();
+      FLASH = 'Worker updated.' + (pin ? ' New PIN saved.' : '');
+      save({ name: document.getElementById('we-name').value, shift_id: Number(document.getElementById('we-shift').value), ...(pin ? { pin } : {}) });
+    };
+    document.getElementById('w-active').onclick = () => {
+      if (w.active && !confirm(`Deactivate ${w.name}? They will not be able to check in until reactivated.`)) return;
+      FLASH = w.active ? `${w.name} deactivated. They can no longer check in.` : `${w.name} reactivated.`;
+      save({ active: !w.active });
+    };
+  }
   const del = document.getElementById('w-del');
   if (del) del.onclick = async () => {
     if (!confirm(`Delete face data for ${w.name}? This cannot be undone. The worker can still use their PIN.`)) return;

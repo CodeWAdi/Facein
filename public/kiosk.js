@@ -106,8 +106,15 @@ async function submitFace(descriptor) {
   state = 'busy'; setPanel('', '<p class="k-big">Checking...</p>');
   try {
     const r = await post('/api/kiosk/face', { kiosk_id: KIOSK_ID, descriptor: Array.from(descriptor, x => Number(x.toFixed(6))) });
-    if (r.result === 'not_recognised') showNotRecognised(); else showResult(r);
+    if (r.result === 'not_recognised') showNotRecognised();
+    else if (r.result === 'rejected') showRejected(r.message);
+    else showResult(r);
   } catch (e) { showError(e.message); }
+}
+function showRejected(text) {
+  state = 'rejected';
+  setPanel('bad', `<p class="k-big">Not accepted</p><p class="k-sub">${esc(text)}</p><button class="k-btn" id="again">OK</button>`);
+  bind('again', showScan); after(6000, showScan);
 }
 function handleFace(r) {
   if (!r || r.score < 0.6) { streak = 0; return; }
