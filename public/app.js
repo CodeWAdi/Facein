@@ -5,7 +5,7 @@ const LABEL = {
   present: 'Present', late: 'Late', absent: 'Absent', not_started: 'Shift not started', weekly_off: 'Weekly off',
   grant: 'Consent given', withdraw: 'Consent withdrawn', none: 'No consent (PIN only)',
   success: 'Success', already_marked: 'Already marked', rejected_unknown_face: 'Rejected - face not recognised',
-  rejected_low_confidence: 'Rejected - low confidence', rejected_wrong_pin: 'Rejected - wrong PIN',
+  rejected_low_confidence: 'Rejected - low confidence', rejected_wrong_pin: 'Rejected - wrong PIN', rejected_locked: 'Rejected - PIN locked (too many wrong PINs)',
   rejected_unknown_code: 'Rejected - unknown worker code', rejected_inactive: 'Rejected - inactive worker', face: 'Face', pin: 'PIN',
   supervisor: 'Supervisor', hr: 'HR Clerk', owner: 'Owner', admin: 'Admin'
 };

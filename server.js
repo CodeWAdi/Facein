@@ -111,12 +111,25 @@ app.post('/api/kiosk/face', async (req, res) => {
   const w = await db.prepare('SELECT * FROM worker WHERE id = ?').get(first[0]);
   res.json(await checkIn(w, k.id, 'face'));
 });
+// B03: after 5 wrong PINs for a worker code within 15 minutes, lock PIN check-in for that code for 15 minutes.
+// Counted from checkin_attempt, so it survives a page refresh or a server restart.
+const PIN_MAX_WRONG = 5, PIN_WINDOW_MS = 15 * 60 * 1000;
+const tsDate = ts => new Date(ts.replace(' ', 'T'));
+async function pinLocked(workerId) {
+  const wrong = (await db.prepare(`SELECT timestamp FROM checkin_attempt WHERE worker_id = ? AND method = 'pin' AND result = 'rejected_wrong_pin'
+    ORDER BY id DESC LIMIT ${PIN_MAX_WRONG}`).all(workerId)).map(r => r.timestamp);
+  if (wrong.length < PIN_MAX_WRONG) return false;
+  const now = Date.now(), newest = wrong[0], oldest = wrong[PIN_MAX_WRONG - 1];
+  // the 5 most recent wrong PINs fall within 15 minutes, and the lock (15 minutes from the 5th) has not run out
+  return oldest >= fmtTs(new Date(+tsDate(newest) - PIN_WINDOW_MS)) && newest > fmtTs(new Date(now - PIN_WINDOW_MS));
+}
 app.post('/api/kiosk/pin', async (req, res) => {
   const { kiosk_id, employee_code, pin } = req.body || {};
   const k = await getKiosk(kiosk_id);
   const w = await db.prepare('SELECT * FROM worker WHERE employee_code = ?').get(String(employee_code || '').trim());
   if (!w) { await logAttempt(null, k.id, 'pin', 'rejected_unknown_code'); return res.json({ result: 'rejected', message: 'Worker code or PIN is wrong' }); }
   if (!w.active) { await logAttempt(w.id, k.id, 'pin', 'rejected_inactive'); return res.json({ result: 'rejected', message: 'Worker is not active. Please see your supervisor.' }); }
+  if (await pinLocked(w.id)) { await logAttempt(w.id, k.id, 'pin', 'rejected_locked'); return res.json({ result: 'rejected', message: 'Too many wrong PINs. Please see your supervisor.' }); }
   if (!/^\d{4}$/.test(String(pin)) || !bcrypt.compareSync(String(pin), w.pin_hash)) {
     await logAttempt(w.id, k.id, 'pin', 'rejected_wrong_pin');
     return res.json({ result: 'rejected', message: 'Worker code or PIN is wrong' });
