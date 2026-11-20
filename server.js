@@ -183,6 +183,26 @@ app.get('/api/dashboard', auth(...VIEW), async (req, res) => {
   res.json({ ...v, exceptions: { pin: v.rows.filter(r => r.method === 'pin'), rejected, absent: v.rows.filter(r => r.status === 'absent') } });
 });
 
+// ---------- live log of kiosk attempts (face scans and PINs) ----------
+// The page polls every few seconds with ?after=<last id seen>, so new attempts appear without a refresh.
+// Only the attempt row is shown: time, kiosk, method, result and, when the worker is known, their name.
+// A face that is not recognised has no worker, so it shows as Unknown. No face image or descriptor is ever kept.
+app.get('/api/attempts/live', auth(...VIEW), async (req, res) => {
+  const date = validDate(req.query.date) ? req.query.date : fmtDate(new Date());
+  const after = Math.max(0, Number.parseInt(req.query.after, 10) || 0);
+  const rows = await db.prepare(`SELECT ca.id, ca.timestamp, ca.method, ca.result, w.name, w.employee_code, k.name kiosk
+    FROM checkin_attempt ca LEFT JOIN worker w ON w.id = ca.worker_id JOIN kiosk k ON k.id = ca.kiosk_id
+    WHERE substr(ca.timestamp,1,10) = ? AND ca.id > ? ORDER BY ca.id DESC LIMIT 200`).all(date, after);
+  const counts = await db.prepare(`SELECT
+      COUNT(*) FILTER (WHERE method = 'face') AS face,
+      COUNT(*) FILTER (WHERE method = 'face' AND worker_id IS NOT NULL) AS face_recognised,
+      COUNT(*) FILTER (WHERE method = 'face' AND worker_id IS NULL) AS face_unknown,
+      COUNT(*) FILTER (WHERE method = 'pin') AS pin
+    FROM checkin_attempt WHERE substr(timestamp,1,10) = ?`).get(date);
+  for (const k in counts) counts[k] = Number(counts[k]);
+  res.json({ date, today: date === fmtDate(new Date()), rows, counts });
+});
+
 // ---------- workers ----------
 app.get('/api/shifts', auth(), async (req, res) => res.json(await db.prepare('SELECT * FROM shift ORDER BY start').all()));
 

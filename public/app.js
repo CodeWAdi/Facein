@@ -33,20 +33,20 @@ function flash() { const f = FLASH; FLASH = ''; return f ? msg(f, 'ok') : ''; }
 
 // ---------- routing ----------
 const NAV = {
-  supervisor: [['#/home', 'Home'], ['#/workers', 'Workers'], ['#/reports', 'Reports']],
-  hr: [['#/home', 'Home'], ['#/workers', 'Workers'], ['#/reports', 'Reports']],
-  owner: [['#/home', 'Home'], ['#/workers', 'Workers'], ['#/reports', 'Reports'], ['#/settings', 'Settings']],
+  supervisor: [['#/home', 'Home'], ['#/live', 'Live scans'], ['#/workers', 'Workers'], ['#/reports', 'Reports']],
+  hr: [['#/home', 'Home'], ['#/live', 'Live scans'], ['#/workers', 'Workers'], ['#/reports', 'Reports']],
+  owner: [['#/home', 'Home'], ['#/live', 'Live scans'], ['#/workers', 'Workers'], ['#/reports', 'Reports'], ['#/settings', 'Settings']],
   admin: [['#/admin', 'Admin']]
 };
 const ROUTES = [
-  [/^#\/home$/, viewHome], [/^#\/workers$/, viewWorkers], [/^#\/workers\/new$/, viewNewWorker],
+  [/^#\/home$/, viewHome], [/^#\/live$/, viewLive], [/^#\/workers$/, viewWorkers], [/^#\/workers\/new$/, viewNewWorker],
   [/^#\/workers\/(\d+)$/, viewWorker], [/^#\/workers\/(\d+)\/enrol$/, viewEnrol],
   [/^#\/record\/(\d+)$/, id => viewRecord({ id })], [/^#\/record\/w\/(\d+)\/(\d{4}-\d{2}-\d{2})$/, (w, d) => viewRecord({ worker_id: w, date: d })],
   [/^#\/reports$/, viewReports], [/^#\/settings$/, viewSettings], [/^#\/admin$/, viewAdmin]
 ];
 let captureSession = 0;
 async function route() {
-  stopCamera(); captureSession++;
+  stopCamera(); stopLive(); captureSession++;
   const h = location.hash && location.hash !== '#/' ? location.hash : NAV[ME.role][0][0];
   document.querySelectorAll('#nav a').forEach(a => a.classList.toggle('on', h.startsWith(a.getAttribute('href'))));
   for (const [re, fn] of ROUTES) {
@@ -109,6 +109,78 @@ async function viewHome() {
   document.getElementById('h-refresh').onclick = () => load();
   await load();
 }
+// ---------- Live scans: every kiosk attempt as it happens ----------
+// Polls /api/attempts/live every 3 seconds for rows newer than the last one seen. Pauses while the tab is hidden.
+const LIVE_MS = 3000;
+let liveTimer = null, liveSession = 0;
+function stopLive() { clearTimeout(liveTimer); liveTimer = null; liveSession++; }
+const liveState = { date: today(), method: '' };
+function liveWho(a) {
+  if (a.name) return `<strong>${esc(a.name)}</strong> <span class="muted">#${esc(a.employee_code)}</span>`;
+  return `<span class="muted">${a.method === 'face' ? 'Unknown face' : 'Unknown worker code'}</span>`;
+}
+function liveRecognised(a) {
+  if (a.method !== 'face') return '<span class="muted">-</span>';
+  return a.name ? '<span class="pill success">Yes</span>' : '<span class="pill rejected">No</span>';
+}
+async function viewLive() {
+  V.innerHTML = `<h1>Live scans</h1>
+    <p class="muted" style="margin-top:0">Every face scan and PIN entry at the kiosks, newest first. Updates by itself every few seconds.
+      Faces that are not recognised show as Unknown. No photo or face data is shown or kept.</p>
+    <div class="card row">
+      <div class="field"><label>Date</label><input type="date" id="l-date" value="${liveState.date}" max="${today()}"></div>
+      <div class="field"><label>Show</label><select id="l-method">
+        <option value="">Face scans and PINs</option><option value="face">Face scans only</option><option value="pin">PINs only</option></select></div>
+      <div class="field"><span id="l-status" class="muted"></span></div>
+    </div>
+    <div class="grid" style="margin-bottom:16px">
+      <div class="stat"><div class="n" id="l-face">0</div><div class="l">Face scans</div></div>
+      <div class="stat ok"><div class="n" id="l-rec">0</div><div class="l">Recognised</div></div>
+      <div class="stat bad"><div class="n" id="l-unk">0</div><div class="l">Not recognised</div></div>
+      <div class="stat"><div class="n" id="l-pin">0</div><div class="l">PIN entries</div></div>
+    </div>
+    <div class="card"><div class="table-wrap"><table>
+      <thead><tr><th>Time</th><th>Who</th><th>Recognised</th><th>Method</th><th>Result</th><th class="hide-sm">Kiosk</th></tr></thead>
+      <tbody id="l-rows"></tbody></table></div><p class="muted" id="l-empty">No attempts yet.</p></div>`;
+  document.getElementById('l-method').value = liveState.method;
+  const session = ++liveSession;
+  let rows = [], lastId = 0, newIds = new Set();
+  const draw = () => {
+    const shown = rows.filter(a => !liveState.method || a.method === liveState.method);
+    document.getElementById('l-rows').innerHTML = shown.map(a => `<tr class="${newIds.has(a.id) ? 'live-new' : ''}">
+      <td>${esc(a.timestamp.slice(11, 19))}</td><td>${liveWho(a)}</td><td>${liveRecognised(a)}</td>
+      <td>${pill(a.method)}</td><td>${pill(a.result)}</td><td class="hide-sm">${esc(a.kiosk)}</td></tr>`).join('');
+    document.getElementById('l-empty').style.display = shown.length ? 'none' : '';
+  };
+  const tick = async () => {
+    if (session !== liveSession) return;
+    const status = document.getElementById('l-status');
+    if (!document.hidden) {
+      try {
+        const d = await api(`/api/attempts/live?date=${liveState.date}&after=${lastId}`);
+        if (session !== liveSession) return;
+        newIds = new Set(lastId ? d.rows.map(a => a.id) : []);
+        if (d.rows.length) {
+          lastId = Math.max(lastId, ...d.rows.map(a => a.id));
+          rows = d.rows.concat(rows).sort((a, b) => b.timestamp.localeCompare(a.timestamp) || b.id - a.id).slice(0, 500);
+        }
+        document.getElementById('l-face').textContent = d.counts.face;
+        document.getElementById('l-rec').textContent = d.counts.face_recognised;
+        document.getElementById('l-unk').textContent = d.counts.face_unknown;
+        document.getElementById('l-pin').textContent = d.counts.pin;
+        draw();
+        status.textContent = d.today ? `Live - updated ${new Date().toLocaleTimeString('en-IN')}` : 'Past day (not live)';
+        if (!d.today) return; // a past day will not change, so stop polling
+      } catch (e) { status.textContent = 'Connection lost - retrying...'; }
+    }
+    liveTimer = setTimeout(tick, LIVE_MS);
+  };
+  const restart = () => { stopLive(); liveState.date = document.getElementById('l-date').value || today(); viewLive(); };
+  document.getElementById('l-date').onchange = restart;
+  document.getElementById('l-method').onchange = e => { liveState.method = e.target.value; draw(); };
+  await tick();
+}
+
 function attTable(rows, date) {
   return `<div class="table-wrap"><table><tr><th>Worker</th><th class="hide-sm">Shift</th><th>Status</th><th>In</th><th>Method</th></tr>
     ${rows.map(r => `<tr class="${r.status === 'not_started' ? '' : 'click'}" data-href="${r.status === 'not_started' ? '' : recordLink(r, date)}">
@@ -243,7 +315,7 @@ async function viewNewWorker() {
   const wz = { step: 0, name: '', code: '', shift_id: SHIFTS[0] && SHIFTS[0].id, accepted: false, descriptor: null };
   const NAMES = ['Details', 'Consent', 'Face or PIN'];
   const render = () => {
-    stopCamera(); captureSession++;
+    stopCamera(); stopLive(); captureSession++;
     if (wz.step === 0) {
       V.innerHTML = `<p><a href="#/workers">&larr; Cancel</a></p><h1>Add worker</h1>${steps(NAMES, 0)}<div class="card">
         <div class="field"><label>Full name</label><input id="n" value="${esc(wz.name)}"></div>
