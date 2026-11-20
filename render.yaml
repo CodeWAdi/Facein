@@ -13,3 +13,5 @@ services:
         value: Asia/Kolkata
       - key: FACE_THRESHOLD
         value: "0.45"
+      - key: DATABASE_URL # Neon Postgres connection string; set it in the Render dashboard
+        sync: false
