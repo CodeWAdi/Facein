@@ -9,11 +9,66 @@ const PORT = process.env.PORT || 3000;
 const SECRET = process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
 const FACE_THRESHOLD = Number(process.env.FACE_THRESHOLD || 0.45); // BR4: strict (face-api default is 0.6)
 const VIEW = ['supervisor', 'hr', 'owner'];
+// Demo accounts (Demo@123) stay ON unless DEMO_ACCOUNTS=false. When off, @facein.demo logins are refused.
+const DEMO = !/^(false|0|no|off)$/i.test(process.env.DEMO_ACCOUNTS || '');
+const isDemoEmail = e => /@facein\.demo$/i.test(String(e || '').trim());
 
 const app = express();
-app.set('trust proxy', 1);
+// Number of proxies in front of the app (Render's edge + load balancer), so req.ip is the real client IP.
+// Check it after deploy with GET /api/admin/client-ip (admin login) and change TRUST_PROXY if needed.
+app.set('trust proxy', /^\d+$/.test(process.env.TRUST_PROXY || '') ? Number(process.env.TRUST_PROXY) : 3);
+app.disable('x-powered-by');
+
+// ---------- security headers ----------
+// face-api.js and its model files come from cdn.jsdelivr.net; everything else is served by this app.
+const CSP = [
+  "default-src 'self'",
+  "script-src 'self' https://cdn.jsdelivr.net",
+  "connect-src 'self' https://cdn.jsdelivr.net",
+  "style-src 'self' 'unsafe-inline'",
+  "img-src 'self' data: blob:",
+  "media-src 'self' blob:",
+  "worker-src 'self' blob:",
+  "object-src 'none'",
+  "base-uri 'none'",
+  "form-action 'self'",
+  "frame-ancestors 'none'"
+].join('; ');
+app.use((req, res, next) => {
+  res.set('Permissions-Policy', 'camera=(self), microphone=(), geolocation=()');
+  res.set('X-Content-Type-Options', 'nosniff');
+  res.set('Content-Security-Policy', CSP);
+  res.set('X-Frame-Options', 'DENY');
+  res.set('Referrer-Policy', 'same-origin');
+  res.set('Cross-Origin-Opener-Policy', 'same-origin');
+  if (req.secure) res.set('Strict-Transport-Security', 'max-age=15552000');
+  next();
+});
+
+// ---------- rate limiting (in memory, per client IP) ----------
+// Fixed window counters. Enough for one Render instance; they reset when the server restarts.
+function counter(windowMs) {
+  const m = new Map();
+  setInterval(() => { const now = Date.now(); for (const [k, v] of m) if (v.reset <= now) m.delete(k); }, 60 * 1000).unref();
+  const get = k => { const now = Date.now(); let h = m.get(k); if (!h || h.reset <= now) { h = { n: 0, reset: now + windowMs }; m.set(k, h); } return h; };
+  return {
+    count: k => get(k).n,
+    add: k => ++get(k).n,
+    clear: k => m.delete(k),
+    retryAfter: k => Math.max(1, Math.ceil((get(k).reset - Date.now()) / 1000))
+  };
+}
+const tooMany = (res, seconds, error) => { res.set('Retry-After', String(seconds)); return res.status(429).json({ error }); };
+function rateLimit(windowMs, max, error) {
+  const c = counter(windowMs);
+  return (req, res, next) => c.add(req.ip) > max ? tooMany(res, c.retryAfter(req.ip), error) : next();
+}
+// Every API call: generous, so normal use (and the Live scans page polling) never hits it.
+app.use('/api', rateLimit(60 * 1000, 600, 'Too many requests. Please wait a minute and try again.'));
+// Kiosk calls are public: a kiosk sends at most one every few seconds.
+app.use('/api/kiosk', rateLimit(60 * 1000, 120, 'Too many attempts from this kiosk. Please wait a minute and try again.'));
+
 app.use(express.json({ limit: '20kb' })); // small limit: images can never be uploaded
-app.use((req, res, next) => { res.set('Permissions-Policy', 'camera=(self)'); res.set('X-Content-Type-Options', 'nosniff'); next(); });
 
 class HttpError extends Error { constructor(status, msg) { super(msg); this.status = status; } }
 const bad = msg => { throw new HttpError(400, msg); };
@@ -36,10 +91,26 @@ const auth = (...roles) => async (req, res, next) => {
   req.user = u; next();
 };
 
+// Login brute-force limits: 10 wrong passwords per email from one IP, or 30 from one IP, in 15 minutes.
+const LOGIN_WINDOW_MS = 15 * 60 * 1000, LOGIN_MAX_PER_EMAIL = 10, LOGIN_MAX_PER_IP = 30;
+const loginFails = counter(LOGIN_WINDOW_MS);
+// Compared against when the email does not exist, so a wrong email takes as long as a wrong password.
+const DUMMY_HASH = bcrypt.hashSync(crypto.randomBytes(16).toString('hex'), 10);
 app.post('/api/login', async (req, res) => {
   const { email, password } = req.body || {};
-  const u = await db.prepare('SELECT * FROM app_user WHERE lower(email) = lower(?)').get(String(email || '').trim());
-  if (!u || !bcrypt.compareSync(String(password || ''), u.password_hash)) return res.status(401).json({ error: 'Wrong email or password' });
+  const em = String(email || '').trim().toLowerCase().slice(0, 200);
+  const ipKey = 'ip:' + req.ip, emailKey = 'em:' + req.ip + ':' + em;
+  if (loginFails.count(ipKey) >= LOGIN_MAX_PER_IP || loginFails.count(emailKey) >= LOGIN_MAX_PER_EMAIL) {
+    return tooMany(res, loginFails.retryAfter(emailKey), 'Too many wrong passwords. Please wait 15 minutes and try again.');
+  }
+  const u = await db.prepare('SELECT * FROM app_user WHERE lower(email) = lower(?)').get(em);
+  // async compare: the server keeps answering other requests while the password is checked
+  const ok = await bcrypt.compare(String(password || '').slice(0, 200), u ? u.password_hash : DUMMY_HASH);
+  if (!u || !ok || (!DEMO && isDemoEmail(u.email))) {
+    loginFails.add(ipKey); loginFails.add(emailKey);
+    return res.status(401).json({ error: 'Wrong email or password' });
+  }
+  loginFails.clear(emailKey);
   const exp = Date.now() + 12 * 3600 * 1000;
   const val = `${u.id}.${exp}`;
   res.set('Set-Cookie', `fi_session=${val}.${sign(val)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=43200${req.secure ? '; Secure' : ''}`);
@@ -49,11 +120,13 @@ app.post('/api/logout', async (req, res) => { res.set('Set-Cookie', 'fi_session=
 app.get('/api/me', auth(), async (req, res) => res.json(req.user));
 app.get('/api/notice', auth(), async (req, res) => res.json(NOTICE));
 app.get('/healthz', async (req, res) => res.json({ ok: true }));
+app.get('/api/config', async (req, res) => res.json({ demo: DEMO })); // the login page shows demo accounts only when on
 
 // ---------- shared helpers ----------
-const logAttempt = async (workerId, kioskId, method, result) =>
-  await db.prepare('INSERT INTO checkin_attempt (worker_id, kiosk_id, method, result, timestamp) VALUES (?,?,?,?,?)')
-    .run(workerId ?? null, kioskId, method, result, fmtTs(new Date()));
+// ip: the client address, used to keep PIN lockouts per device (see pinLocked)
+const logAttempt = async (workerId, kioskId, method, result, ip = null) =>
+  await db.prepare('INSERT INTO checkin_attempt (worker_id, kiosk_id, method, result, timestamp, ip) VALUES (?,?,?,?,?,?)')
+    .run(workerId ?? null, kioskId, method, result, fmtTs(new Date()), ip);
 const hasActiveConsent = async workerId =>
   (await db.prepare('SELECT decision FROM consent WHERE worker_id = ? ORDER BY id DESC LIMIT 1').get(workerId) || {}).decision === 'grant';
 const validDescriptor = d => Array.isArray(d) && d.length === 128 && d.every(x => typeof x === 'number' && Number.isFinite(x) && Math.abs(x) < 10);
@@ -68,26 +141,26 @@ function inShiftWindow(shift, nowMin) {
 }
 
 // BR1 + BR2: one record per worker per date; late after start + grace
-async function checkIn(w, kioskId, method) {
+async function checkIn(w, kioskId, method, ip = null) {
   const now = new Date(), date = fmtDate(now), hm = fmtHM(now);
   const existing = await db.prepare('SELECT status, check_in_time FROM daily_attendance WHERE worker_id = ? AND date = ?').get(w.id, date);
   if (existing) {
-    await logAttempt(w.id, kioskId, method, 'already_marked');
+    await logAttempt(w.id, kioskId, method, 'already_marked', ip);
     return { result: 'already_marked', name: w.name, status: existing.status, time: existing.check_in_time };
   }
   const shift = await db.prepare('SELECT * FROM shift WHERE id = ?').get(w.shift_id);
   if (!inShiftWindow(shift, now.getHours() * 60 + now.getMinutes())) {
-    await logAttempt(w.id, kioskId, method, 'rejected_outside_shift');
+    await logAttempt(w.id, kioskId, method, 'rejected_outside_shift', ip);
     return { result: 'rejected', name: w.name, message: `Not your shift time. ${shift.name} shift check-in opens 2 hours before ${shift.start} and closes at ${shift.end}.` };
   }
   const status = now.getHours() * 60 + now.getMinutes() > toMin(shift.start) + shift.grace_minutes ? 'late' : 'present';
   try {
     await tx(async () => {
       await db.prepare('INSERT INTO daily_attendance (worker_id, date, status, check_in_time) VALUES (?,?,?,?)').run(w.id, date, status, hm);
-      await logAttempt(w.id, kioskId, method, 'success');
+      await logAttempt(w.id, kioskId, method, 'success', ip);
     });
   } catch (e) {
-    if (e.code === '23505' || /UNIQUE|duplicate key/i.test(e.message)) { await logAttempt(w.id, kioskId, method, 'already_marked'); return { result: 'already_marked', name: w.name }; }
+    if (e.code === '23505' || /UNIQUE|duplicate key/i.test(e.message)) { await logAttempt(w.id, kioskId, method, 'already_marked', ip); return { result: 'already_marked', name: w.name }; }
     throw e;
   }
   return { result: 'success', name: w.name, status, time: hm };
@@ -116,36 +189,45 @@ app.post('/api/kiosk/face', async (req, res) => {
   const ranked = [...best].sort((a, b) => a[1] - b[1]);
   const [first, second] = ranked;
   if (!first || !(first[1] <= FACE_THRESHOLD) || (second && second[1] - first[1] < MATCH_MARGIN)) {
-    await logAttempt(null, k.id, 'face', 'rejected_low_confidence');
+    await logAttempt(null, k.id, 'face', 'rejected_low_confidence', req.ip);
     return res.json({ result: 'not_recognised' });
   }
   const w = await db.prepare('SELECT * FROM worker WHERE id = ?').get(first[0]);
-  res.json(await checkIn(w, k.id, 'face'));
+  res.json(await checkIn(w, k.id, 'face', req.ip));
 });
 // B03: after 5 wrong PINs for a worker code within 15 minutes, lock PIN check-in for that code for 15 minutes.
 // Counted from checkin_attempt, so it survives a page refresh or a server restart.
-const PIN_MAX_WRONG = 5, PIN_WINDOW_MS = 15 * 60 * 1000;
+// The lock is per device (client IP), so someone elsewhere typing wrong PINs cannot lock the worker out at the
+// factory kiosk. To stop guessing spread over many devices, 20 wrong PINs for a code from anywhere also lock it,
+// except on devices that have had a successful check-in in the last 30 days (the factory's own kiosks).
+const PIN_MAX_WRONG = 5, PIN_MAX_WRONG_ALL = 20, PIN_WINDOW_MS = 15 * 60 * 1000, KNOWN_DEVICE_DAYS = 30;
 const tsDate = ts => new Date(ts.replace(' ', 'T'));
-async function pinLocked(workerId) {
+async function lockedByRecentWrongPins(workerId, max, ip) {
   const wrong = (await db.prepare(`SELECT timestamp FROM checkin_attempt WHERE worker_id = ? AND method = 'pin' AND result = 'rejected_wrong_pin'
-    ORDER BY id DESC LIMIT ${PIN_MAX_WRONG}`).all(workerId)).map(r => r.timestamp);
-  if (wrong.length < PIN_MAX_WRONG) return false;
-  const now = Date.now(), newest = wrong[0], oldest = wrong[PIN_MAX_WRONG - 1];
-  // the 5 most recent wrong PINs fall within 15 minutes, and the lock (15 minutes from the 5th) has not run out
+    AND (?::text IS NULL OR ip = ?::text) ORDER BY id DESC LIMIT ?`).all(workerId, ip, ip, max)).map(r => r.timestamp);
+  if (wrong.length < max) return false;
+  const now = Date.now(), newest = wrong[0], oldest = wrong[max - 1];
+  // the most recent wrong PINs fall within 15 minutes, and the lock (15 minutes from the last one) has not run out
   return oldest >= fmtTs(new Date(+tsDate(newest) - PIN_WINDOW_MS)) && newest > fmtTs(new Date(now - PIN_WINDOW_MS));
+}
+const knownDevice = async ip => !!await db.prepare(`SELECT 1 FROM checkin_attempt WHERE ip = ? AND result = 'success' AND timestamp >= ? LIMIT 1`)
+  .get(ip, fmtTs(new Date(Date.now() - KNOWN_DEVICE_DAYS * 86400000)));
+async function pinLocked(workerId, ip) {
+  if (await lockedByRecentWrongPins(workerId, PIN_MAX_WRONG, ip)) return true;
+  return await lockedByRecentWrongPins(workerId, PIN_MAX_WRONG_ALL, null) && !await knownDevice(ip);
 }
 app.post('/api/kiosk/pin', async (req, res) => {
   const { kiosk_id, employee_code, pin } = req.body || {};
   const k = await getKiosk(kiosk_id);
   const w = await db.prepare('SELECT * FROM worker WHERE employee_code = ?').get(String(employee_code || '').trim());
-  if (!w) { await logAttempt(null, k.id, 'pin', 'rejected_unknown_code'); return res.json({ result: 'rejected', message: 'Worker code or PIN is wrong' }); }
-  if (!w.active) { await logAttempt(w.id, k.id, 'pin', 'rejected_inactive'); return res.json({ result: 'rejected', message: 'Worker is not active. Please see your supervisor.' }); }
-  if (await pinLocked(w.id)) { await logAttempt(w.id, k.id, 'pin', 'rejected_locked'); return res.json({ result: 'rejected', message: 'Too many wrong PINs. Please see your supervisor.' }); }
-  if (!/^\d{4}$/.test(String(pin)) || !bcrypt.compareSync(String(pin), w.pin_hash)) {
-    await logAttempt(w.id, k.id, 'pin', 'rejected_wrong_pin');
+  if (!w) { await logAttempt(null, k.id, 'pin', 'rejected_unknown_code', req.ip); return res.json({ result: 'rejected', message: 'Worker code or PIN is wrong' }); }
+  if (!w.active) { await logAttempt(w.id, k.id, 'pin', 'rejected_inactive', req.ip); return res.json({ result: 'rejected', message: 'Worker is not active. Please see your supervisor.' }); }
+  if (await pinLocked(w.id, req.ip)) { await logAttempt(w.id, k.id, 'pin', 'rejected_locked', req.ip); return res.json({ result: 'rejected', message: 'Too many wrong PINs. Please see your supervisor.' }); }
+  if (!/^\d{4}$/.test(String(pin)) || !await bcrypt.compare(String(pin), w.pin_hash)) {
+    await logAttempt(w.id, k.id, 'pin', 'rejected_wrong_pin', req.ip);
     return res.json({ result: 'rejected', message: 'Worker code or PIN is wrong' });
   }
-  res.json(await checkIn(w, k.id, 'pin'));
+  res.json(await checkIn(w, k.id, 'pin', req.ip));
 });
 
 // ---------- day view (home, daily report) ----------
@@ -222,7 +304,7 @@ app.post('/api/workers', auth('supervisor'), async (req, res) => {
   const id = await tx(async () => {
     const ts = fmtTs(new Date());
     const wid = Number((await db.prepare('INSERT INTO worker (name, employee_code, shift_id, active, pin_hash, created_at) VALUES (?,?,?,1,?,?)')
-      .run(nm, code, Number(shift_id), bcrypt.hashSync(String(pin), 10), ts)).lastInsertRowid);
+      .run(nm, code, Number(shift_id), await bcrypt.hash(String(pin), 10), ts)).lastInsertRowid);
     if (accepted) await db.prepare('INSERT INTO consent (worker_id, decision, notice_version, timestamp) VALUES (?,?,?,?)').run(wid, 'grant', NOTICE.version, ts);
     if (descriptor) await db.prepare('INSERT INTO face_template (worker_id, descriptor, created_at) VALUES (?,?,?)').run(wid, JSON.stringify(descriptor.map(x => +x.toFixed(6))), ts);
     return wid;
@@ -242,7 +324,7 @@ app.put('/api/workers/:id', auth('supervisor'), async (req, res) => {
   if (typeof active !== 'boolean') bad('Choose active or inactive');
   if (pin) validPin(pin);
   await db.prepare('UPDATE worker SET name = ?, shift_id = ?, active = ? WHERE id = ?').run(nm, Number(shift_id), active ? 1 : 0, w.id);
-  if (pin) await db.prepare('UPDATE worker SET pin_hash = ? WHERE id = ?').run(bcrypt.hashSync(String(pin), 10), w.id);
+  if (pin) await db.prepare('UPDATE worker SET pin_hash = ? WHERE id = ?').run(await bcrypt.hash(String(pin), 10), w.id);
   res.json({ ok: true });
 });
 
@@ -397,14 +479,16 @@ app.post('/api/shifts', auth('admin'), async (req, res) => {
   res.json({ id: Number(r.lastInsertRowid) });
 });
 
+// Shows the client IP the server sees, so the TRUST_PROXY setting can be checked after a deploy.
+app.get('/api/admin/client-ip', auth('admin'), async (req, res) => res.json({ ip: req.ip, x_forwarded_for: req.headers['x-forwarded-for'] || null, trust_proxy: app.get('trust proxy') }));
 app.get('/api/admin/users', auth('admin'), async (req, res) => res.json(await db.prepare('SELECT id, name, email, role FROM app_user ORDER BY id').all()));
 const ROLES = ['supervisor', 'hr', 'owner', 'admin'];
 app.post('/api/admin/users', auth('admin'), async (req, res) => {
   const { name, email, role, password } = req.body || {};
   if (!String(name || '').trim() || !/^\S+@\S+\.\S+$/.test(email || '') || !ROLES.includes(role)) bad('Enter name, a valid email and a role');
-  if (String(password || '').length < 8) bad('Password must be at least 8 characters');
+  if (String(password || '').length < 8 || String(password).length > 72) bad('Password must be 8 to 72 characters');
   if (await db.prepare('SELECT 1 FROM app_user WHERE lower(email) = lower(?)').get(email.trim())) bad('Email already used');
-  const r = await db.prepare('INSERT INTO app_user (name, email, password_hash, role) VALUES (?,?,?,?)').run(name.trim(), email.trim(), bcrypt.hashSync(password, 10), role);
+  const r = await db.prepare('INSERT INTO app_user (name, email, password_hash, role) VALUES (?,?,?,?)').run(name.trim(), email.trim(), await bcrypt.hash(String(password), 10), role);
   res.json({ id: Number(r.lastInsertRowid) });
 });
 app.put('/api/admin/users/:id', auth('admin'), async (req, res) => {
@@ -417,8 +501,8 @@ app.put('/api/admin/users/:id', auth('admin'), async (req, res) => {
     await db.prepare('UPDATE app_user SET role = ? WHERE id = ?').run(role, u.id);
   }
   if (password !== undefined) {
-    if (String(password).length < 8) bad('Password must be at least 8 characters');
-    await db.prepare('UPDATE app_user SET password_hash = ? WHERE id = ?').run(bcrypt.hashSync(String(password), 10), u.id);
+    if (String(password).length < 8 || String(password).length > 72) bad('Password must be 8 to 72 characters');
+    await db.prepare('UPDATE app_user SET password_hash = ? WHERE id = ?').run(await bcrypt.hash(String(password), 10), u.id);
   }
   res.json({ ok: true });
 });

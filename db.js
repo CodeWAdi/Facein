@@ -18,7 +18,7 @@ async function connect() {
     pg.types.setTypeParser(20, Number);   // COUNT(*) / bigint -> JS number
     pg.types.setTypeParser(1700, Number); // numeric -> JS number
     const local = /@(localhost|127\.0\.0\.1)[:/]/.test(DATABASE_URL);
-    const pool = new pg.Pool({ connectionString: DATABASE_URL, max: 5, ssl: local ? false : { rejectUnauthorized: false } });
+    const pool = new pg.Pool({ connectionString: DATABASE_URL, max: 5, connectionTimeoutMillis: 10000, ssl: local ? false : { rejectUnauthorized: false } });
     pool.on('error', e => console.error('Postgres pool error:', e.message));
     backend = {
       kind: 'postgres',
@@ -154,6 +154,9 @@ CREATE TABLE IF NOT EXISTS override (
   supervisor_id INTEGER NOT NULL REFERENCES app_user(id),
   timestamp TEXT NOT NULL
 );
+-- client IP of each kiosk attempt: PIN lockouts are kept per device (server.js pinLocked)
+ALTER TABLE checkin_attempt ADD COLUMN IF NOT EXISTS ip TEXT;
+CREATE INDEX IF NOT EXISTS ix_attempt_ip ON checkin_attempt(ip, result);
 CREATE INDEX IF NOT EXISTS ix_attempt_worker_ts ON checkin_attempt(worker_id, timestamp);
 CREATE INDEX IF NOT EXISTS ix_attempt_ts ON checkin_attempt(timestamp);
 CREATE INDEX IF NOT EXISTS ix_att_date ON daily_attendance(date);
@@ -229,7 +232,33 @@ const NAMES = ['Ramesh Kumar', 'Sunita Devi', 'Arjun Patil', 'Lakshmi Narayanan'
   'Shabana Khan', 'Mahesh Gowda', 'Nirmala Das', 'Ashok Pandey', 'Bhavani Shankar', 'Imran Shaikh', 'Lalitha Iyer',
   'Venkatesh Rao', 'Harpreet Kaur', 'Dinesh Yadav', 'Saroja Murthy', 'Tarun Bose', 'Usha Rani'];
 
+// DEMO_ACCOUNTS=false: no demo data. The first start creates two shifts, one kiosk and one admin from
+// ADMIN_EMAIL / ADMIN_PASSWORD (12+ characters); the admin then adds real staff on the Admin page.
+const DEMO = !/^(false|0|no|off)$/i.test(process.env.DEMO_ACCOUNTS || '');
+async function seedProduction() {
+  const email = String(process.env.ADMIN_EMAIL || '').trim(), pw = String(process.env.ADMIN_PASSWORD || '');
+  if (!/^\S+@\S+\.\S+$/.test(email) || pw.length < 12 || pw.length > 72) {
+    throw new Error('DEMO_ACCOUNTS=false needs ADMIN_EMAIL and ADMIN_PASSWORD (12 to 72 characters) for the first admin');
+  }
+  await tx(async () => {
+    if (!(await db.prepare('SELECT COUNT(*) AS c FROM shift').get()).c) {
+      await db.prepare('INSERT INTO shift (name, start, "end", grace_minutes) VALUES (?,?,?,?)').run('Morning', '06:00', '14:00', 10);
+      await db.prepare('INSERT INTO shift (name, start, "end", grace_minutes) VALUES (?,?,?,?)').run('Evening', '14:00', '22:00', 10);
+    }
+    if (!(await db.prepare('SELECT COUNT(*) AS c FROM kiosk').get()).c) {
+      await db.prepare('INSERT INTO kiosk (name, location) VALUES (?,?)').run('Gate Kiosk', 'Main gate');
+    }
+    await db.prepare('INSERT INTO app_user (name, email, password_hash, role) VALUES (?,?,?,?)').run('Admin', email, await bcrypt.hash(pw, 10), 'admin');
+  });
+  return true;
+}
+
 async function seed() {
+  // Without demo mode, only real (non-demo) accounts count: an old demo database still gets a real admin.
+  if (!DEMO) {
+    if ((await db.prepare(`SELECT COUNT(*) AS c FROM app_user WHERE lower(email) NOT LIKE '%@facein.demo'`).get()).c > 0) return false;
+    return seedProduction();
+  }
   if ((await db.prepare('SELECT COUNT(*) AS c FROM app_user').get()).c > 0) return false;
   let s = 20261112;
   const rnd = () => (s = (s * 1664525 + 1013904223) % 4294967296) / 4294967296;

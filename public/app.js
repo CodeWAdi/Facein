@@ -311,7 +311,7 @@ async function viewEnrol(id) {
 async function viewRecord(q) {
   const d = await api(`/api/record?${new URLSearchParams(q)}`), r = d.record, w = d.worker;
   const success = d.attempts.find(a => a.result === 'success');
-  V.innerHTML = `${flash()}<p><a href="javascript:history.back()">&larr; Back</a></p><h1>Attendance record</h1>
+  V.innerHTML = `${flash()}<p><a href="#/home" id="r-back">&larr; Back</a></p><h1>Attendance record</h1>
     <div class="card"><dl class="kv"><dt>Worker</dt><dd><a href="#/workers/${w.id}">${esc(w.name)}</a> #${esc(w.employee_code)}</dd>
       <dt>Date</dt><dd>${niceDate(r.date)}</dd><dt>Shift</dt><dd>${esc(w.shift_name)} (starts ${w.start}, grace ${w.grace_minutes} min)</dd>
       <dt>Status</dt><dd>${pill(r.status)}${r.id ? '' : ' <span class="muted">(no check-in)</span>'}</dd>
@@ -325,6 +325,7 @@ async function viewRecord(q) {
       ${d.overrides.map(o => `<tr><td>${esc(o.timestamp)}</td><td>${pill(o.old_status)} &rarr; ${pill(o.new_status)}</td><td>${esc(o.reason)}</td><td>${esc(o.supervisor)}</td></tr>`).join('')}</table></div>` : '<p class="muted">No overrides</p>'}</div>
     <div class="card"><h2>Kiosk attempts that day</h2>${d.attempts.length ? `<div class="table-wrap"><table><tr><th>Time</th><th>Method</th><th>Result</th><th class="hide-sm">Kiosk</th></tr>
       ${d.attempts.map(a => `<tr><td>${a.timestamp.slice(11, 19)}</td><td>${pill(a.method)}</td><td>${pill(a.result)}</td><td class="hide-sm">${esc(a.kiosk)}</td></tr>`).join('')}</table></div>` : '<p class="muted">No attempts</p>'}</div>`;
+  document.getElementById('r-back').onclick = e => { if (history.length > 1) { e.preventDefault(); history.back(); } };
   const save = document.getElementById('o-save');
   if (save) save.onclick = async () => {
     const reason = document.getElementById('o-why').value.trim();
